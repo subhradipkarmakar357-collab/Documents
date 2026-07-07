@@ -1,14 +1,14 @@
 import argparse
+import json
+import os
 import pickle
 import re
+import socket
+import time
+import urllib.error
+import urllib.request
 
 import faiss
-import os
-import json
-try:
-    import openai
-except Exception:
-    openai = None
 from sentence_transformers import SentenceTransformer
 
 DEFAULT_MODEL = 'all-MiniLM-L6-v2'
@@ -48,8 +48,15 @@ def _extract_year(query):
     return years[0] if years else None
 
 
+def _extract_hyphenated_year(query):
+    match = re.search(r'\b(19\d{2}|20\d{2})\s*-\s*(\d{2})\b', query, re.IGNORECASE)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return None
+
+
 def _extract_year_range(query):
-    # patterns like 'between 1946 and 1950', 'from 1946 to 1950'
+    # patterns like 'between 1946 and 1950', 'from 1946 to 1950', '1946-47'
     match = re.search(r'\bbetween\s+(19\d{2}|20\d{2})\s+and\s+(19\d{2}|20\d{2})\b', query, re.IGNORECASE)
     if match:
         start, end = int(match.group(1)), int(match.group(2))
@@ -58,6 +65,12 @@ def _extract_year_range(query):
     match = re.search(r'\bfrom\s+(19\d{2}|20\d{2})\s+(?:to|until|through)\s+(19\d{2}|20\d{2})\b', query, re.IGNORECASE)
     if match:
         start, end = int(match.group(1)), int(match.group(2))
+        return (min(start, end), max(start, end))
+
+    match = re.search(r'\b(19\d{2}|20\d{2})\s*-\s*(\d{2})\b', query, re.IGNORECASE)
+    if match:
+        start = int(match.group(1))
+        end = int(f"{match.group(1)[:2]}{match.group(2)}")
         return (min(start, end), max(start, end))
 
     return None
@@ -133,7 +146,7 @@ def _extract_distinct_field(query):
     query_lower = query.lower()
     # require explicit list-style intent (avoid matching phrases like
     # "mention the movie name and genre")
-    if not re.search(r'\b(?:distinct|unique|all|list|show|give|names? of|which are|what are)\b', query_lower):
+    if not re.search(r'\b(?:distinct|unique|all|list|show|give|name the|names of|which are|what are)\b', query_lower):
         return None
 
     field_map = {
@@ -264,19 +277,19 @@ def _matches_year_range(year_range, chunk):
         return False
 
     text_fields = f"{chunk.get('year',' ')} {chunk.get('release_date',' ')}"
-    years = re.findall(r'\b(?:19|20)\d{2}\b', text_fields)
+    years = []
+    for year_text in re.findall(r'\b(?:19|20)\d{2}(?:-\d{2})?\b', text_fields):
+        if '-' in year_text:
+            start_text, _ = year_text.split('-', 1)
+            years.append(int(start_text))
+        else:
+            years.append(int(year_text))
+
     if not years:
         return False
 
     start, end = year_range
-    for y in years:
-        try:
-            yv = int(y)
-        except Exception:
-            continue
-        if start <= yv <= end:
-            return True
-    return False
+    return any(start <= y <= end for y in years)
 
 
 def _matches_title(query_title, chunk):
@@ -315,13 +328,17 @@ def _matches_field(field, query_value, chunk):
 
 def _extract_query_filters(query):
     filters = {}
-    year_range = _extract_year_range(query)
-    if year_range:
-        filters['year_range'] = year_range
+    hyphen_year = _extract_hyphenated_year(query)
+    if hyphen_year:
+        filters['year'] = hyphen_year
     else:
-        year = _extract_year(query)
-        if year:
-            filters['year'] = year
+        year_range = _extract_year_range(query)
+        if year_range:
+            filters['year_range'] = year_range
+        else:
+            year = _extract_year(query)
+            if year:
+                filters['year'] = year
 
     director = _extract_director(query)
     if director:
@@ -378,14 +395,38 @@ def _boost_score(chunk, query):
         boost += 0.15
 
     return boost
+
+
+def _rank_filtered_chunks(chunks, search_results, filters):
+    if not filters:
+        return [(score, chunk) for score, chunk in search_results]
+
+    matched_chunks = [
+        chunk for chunk in chunks
+        if all(_matches_field(field, value, chunk) for field, value in filters.items())
+    ]
+    if not matched_chunks:
+        return [(score, chunk) for score, chunk in search_results]
+
+    score_lookup = {id(chunk): score for score, chunk in search_results}
+    ranked_chunks = sorted(
+        matched_chunks,
+        key=lambda chunk: (score_lookup.get(id(chunk), float('inf')), str(chunk.get('title', '')).lower()),
+    )
+    return [(score_lookup.get(id(chunk), 0.0), chunk) for chunk in ranked_chunks]
+
+
 def retrieve_file(query, k=5):
     model, chunks, index = load_artifacts()
 
     distinct_field = _extract_distinct_field(query)
     if distinct_field:
+        filters = _extract_query_filters(query)
         values = []
         seen = set()
         for chunk in chunks:
+            if filters and not all(_matches_field(field, value, chunk) for field, value in filters.items()):
+                continue
             value = chunk.get(distinct_field, '')
             if not value:
                 continue
@@ -399,7 +440,7 @@ def retrieve_file(query, k=5):
             return [(0.0, {'title': value, 'text': value, 'kind': distinct_field}) for value in values]
 
     qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype('float32')
-    search_k = min(len(chunks), max(k * 3, 20))
+    search_k = len(chunks)
     D, I = index.search(qvec, k=search_k)
 
     results = []
@@ -413,28 +454,40 @@ def retrieve_file(query, k=5):
 
     filters = _extract_query_filters(query)
     if filters:
-        strict_matches = [
-            (score, chunk)
-            for score, chunk in results
-            if all(_matches_field(field, value, chunk) for field, value in filters.items())
-        ]
-        if strict_matches:
-            return strict_matches
+        ranked = _rank_filtered_chunks(chunks, results, filters)
+        if ranked:
+            return ranked[:k]
 
-        strict_matches_all = [
-            (0.0, chunk)
-            for chunk in chunks
-            if all(_matches_field(field, value, chunk) for field, value in filters.items())
-        ]
-        if strict_matches_all:
-            return strict_matches_all
-
-    return results
+    return results[:k]
 
 
-def _synthesize_with_openai(question, chunks):
-    if not openai or not os.getenv('OPENAI_API_KEY'):
-        return None
+def _build_structured_answer(question, chunks):
+    if not chunks:
+        return 'No information in the provided context.'
+
+    normalized_question = question.lower()
+    if 'how many' in normalized_question and 'between' in normalized_question:
+        lines = [f"{len(chunks)} movies:"]
+        for idx, chunk in enumerate(chunks, start=1):
+            title = chunk.get('title', 'Unknown')
+            genre = chunk.get('genre', '') or 'Unknown'
+            year = chunk.get('year', '')
+            if year:
+                lines.append(f"{idx}. {title} — {genre} ({year})")
+            else:
+                lines.append(f"{idx}. {title} — {genre}")
+        return '\n'.join(lines)
+
+    return None
+
+
+def _synthesize_with_ollama(question, chunks):
+    host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
+    model_name = os.getenv('OLLAMA_MODEL', 'llama3.2:latest')
+
+    structured_answer = _build_structured_answer(question, chunks)
+    if structured_answer:
+        return structured_answer
 
     # Build a focused CONTEXT from the top chunks
     ctx_parts = []
@@ -443,8 +496,7 @@ def _synthesize_with_openai(question, chunks):
         year = c.get('year', '')
         genre = c.get('genre', '')
         text = c.get('text', '')
-        # concise context lines per record
-        ctx_parts.append(f"Title: {title} ({year})\nGenre: {genre}\n{ text }")
+        ctx_parts.append(f"Title: {title} ({year})\nGenre: {genre}\n{text}")
 
     context_text = '\n\n'.join(ctx_parts)
 
@@ -466,42 +518,32 @@ def _synthesize_with_openai(question, chunks):
         "6) Keep the answer under 200 words."
     )
 
-    messages = [
-        {'role': 'system', 'content': system_content},
-        {'role': 'user', 'content': user_content},
-    ]
+    prompt = (
+        f"System: {system_content}\n\n"
+        f"User: {user_content}\n\n"
+        "Assistant:"
+    )
+
+    payload = {
+        'model': model_name,
+        'prompt': prompt,
+        'stream': False,
+        'options': {'temperature': 0.0},
+    }
+
+    req = urllib.request.Request(
+        f'{host}/api/generate',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
 
     try:
-        model_name = os.getenv('OPENAI_MODEL', 'gpt-3.5-turbo')
-        resp = openai.ChatCompletion.create(model=model_name, messages=messages, max_tokens=400, temperature=0.0)
-        return resp['choices'][0]['message']['content'].strip()
-    except Exception:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode('utf-8'))
+            return body.get('response', '').strip() or None
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, ConnectionRefusedError, socket.timeout, OSError):
         return None
-
-
-def _synthesize_fallback(question, chunks):
-    # Deterministic fallback: if query includes year_range or year filters, prefer those
-    filters = _extract_query_filters(question)
-    if 'year_range' in filters or 'year' in filters:
-        # use the strict matches behavior from retrieve_file
-        matches = []
-        for chunk in chunks:
-            if all(_matches_field(f, v, chunk) for f, v in filters.items()):
-                matches.append(chunk)
-        if matches:
-            lines = [f"{m.get('title')} — {m.get('genre', 'Unknown')}" for m in matches]
-            return f"{len(matches)} movies:\n" + '\n'.join(lines)
-
-    # Generic fallback: summarize top-k chunks
-    top = chunks[:5]
-    if not top:
-        return 'No relevant information found.'
-    lines = []
-    for c in top:
-        title = c.get('title') or c.get('text')[:60]
-        genre = c.get('genre', '')
-        lines.append(f"- {title}{f' — {genre}' if genre else ''}")
-    return 'Answer based on top documents:\n' + '\n'.join(lines)
 
 
 def answer_query(query, k=5):
@@ -510,9 +552,12 @@ def answer_query(query, k=5):
     # handle distinct-field queries directly
     distinct_field = _extract_distinct_field(query)
     if distinct_field:
+        filters = _extract_query_filters(query)
         values = []
         seen = set()
         for chunk in chunks:
+            if filters and not all(_matches_field(field, value, chunk) for field, value in filters.items()):
+                continue
             value = chunk.get(distinct_field, '')
             if not value:
                 continue
@@ -526,7 +571,7 @@ def answer_query(query, k=5):
 
     # perform embedding search
     qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype('float32')
-    search_k = min(len(chunks), max(k * 3, 20))
+    search_k = len(chunks)
     D, I = index.search(qvec, k=search_k)
     results = []
     for dist, idx in zip(D[0], I[0]):
@@ -535,20 +580,26 @@ def answer_query(query, k=5):
             boosted_score = float(dist) + _boost_score(chunk, query)
             results.append((boosted_score, chunk))
     results.sort(key=lambda item: item[0], reverse=True)
-    ranked_chunks = [c for _, c in results]
 
-    # Try OpenAI first
-    text = _synthesize_with_openai(query, ranked_chunks)
+    filters = _extract_query_filters(query)
+    if filters:
+        ranked_chunks = [chunk for _, chunk in _rank_filtered_chunks(chunks, results, filters)]
+    else:
+        ranked_chunks = [chunk for _, chunk in results]
+
+    start_time = time.perf_counter()
+    text = _synthesize_with_ollama(query, ranked_chunks)
+    latency = time.perf_counter() - start_time
+
     if text:
-        return text
+        return f"{text}\n\nLLM latency: {latency:.3f} seconds"
 
-    # Fallback deterministic synthesizer
-    return _synthesize_fallback(query, ranked_chunks)
+    return "Ollama did not return a response. Check that the Ollama server is running and the requested model is available."
 def main():
     parser = argparse.ArgumentParser(description='Query the embedding-based FAISS index of documents')
     parser.add_argument('query', nargs='*', help='Query text (if omitted, enters interactive prompt)')
     parser.add_argument('-k', '--k', type=int, default=5, help='Number of results to return')
-    parser.add_argument('--answer', action='store_true', help='Return synthesized answer using an LLM instead of raw chunks')
+    parser.add_argument('--answer', action='store_true', help='Return a synthesized answer using the local Ollama model instead of raw chunks')
     args = parser.parse_args()
 
     if args.query:

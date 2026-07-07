@@ -7,13 +7,19 @@ from retrieval import (
     _extract_genre,
     _extract_release_date,
     _extract_year,
+    _extract_year_range,
+    _extract_hyphenated_year,
+    _extract_query_filters,
     _extract_distinct_field,
     _matches_director,
     _matches_actors,
     _matches_genre,
     _matches_release_date,
     _matches_year,
+    _matches_year_range,
+    answer_query,
     format_chunk,
+    retrieve_file,
 )
 
 
@@ -76,6 +82,64 @@ def test_release_date_and_year_query_matches_metadata():
     assert _extract_release_date('which film was released in 1943') == '1943'
     assert _matches_year('1943', chunk) is True
     assert _matches_release_date('in 1943', chunk) is True
+
+
+def test_hyphenated_year_ranges_are_parsed_and_matched():
+    assert _extract_year_range('what was the plot of the movie that got oscar in 1946-47') == (1946, 1947)
+    assert _matches_year_range((1946, 1947), {'year': '1946-47'}) is True
+
+
+def test_hyphenated_year_queries_use_exact_year_filter():
+    query = 'what was the plot of the movie that got oscar in 1946-47'
+    assert _extract_hyphenated_year(query) == '1946-47'
+    assert _extract_query_filters(query) == {'year': '1946-47'}
+
+
+def test_year_range_query_returns_all_matches_in_range():
+    query = 'How many movies got Oscars between 1946 and 1950. Mention the movie name and genre.'
+    results = retrieve_file(query, k=10)
+    titles = [chunk['title'] for _, chunk in results]
+
+    expected_titles = [
+        'The Best Years of Our Lives',
+        "Gentleman's Agreement",
+        'Hamlet',
+        "All the King's Men",
+        'Sunset Boulevard',
+    ]
+
+    for title in expected_titles:
+        assert title in titles
+
+    assert 'The Lost Weekend' not in titles
+
+
+def test_answer_query_lists_all_year_range_matches():
+    query = 'How many movies got Oscars between 1946 and 1950. Mention the movie name and genre.'
+    answer = answer_query(query, k=10)
+
+    assert '5 movies:' in answer
+    assert 'The Best Years of Our Lives' in answer
+    assert "Gentleman's Agreement" in answer
+    assert 'Hamlet' in answer
+    assert "All the King's Men" in answer
+    assert 'Sunset Boulevard' in answer
+
+
+def test_extract_distinct_field_name_the_directors():
+    query = 'Name the directors that got Oscar between 1930 and 1935.'
+    assert _extract_distinct_field(query) == 'director'
+
+
+def test_answer_query_returns_directors_for_year_range():
+    query = 'Name the directors that got Oscar between 1930 and 1935.'
+    answer = answer_query(query, k=10)
+
+    assert 'Wesley Ruggles' in answer
+    assert 'Edmund Goulding' in answer
+    assert 'Frank Lloyd' in answer
+    assert 'Frank Capra' in answer
+    assert 'James Whale' in answer
 
 
 def test_distinct_genre_query_is_detected():

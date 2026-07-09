@@ -1,3 +1,4 @@
+
 import argparse
 import json
 import os
@@ -9,179 +10,186 @@ import urllib.request
 
 import faiss
 import numpy as np
+from sentence_transformers import CrossEncoder
+from rag_evaluation import evaluate_pipeline
 
-DEFAULT_EMBEDDING_MODEL = 'nomic-embed-text'
-DEFAULT_LLM_MODEL = 'llama3.2:latest'
+OLLAMA_EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "nomic-embed-text"
+)
 
+OLLAMA_LLM_MODEL = os.getenv(
+    "LLM_MODEL",
+    "llama3.2:latest"
+)
+
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "1.0"))
+
+print("Loading reranker...")
+RERANKER = CrossEncoder(
+    os.getenv(
+        "RERANKER_MODEL",
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    )
+)
+print("Reranker loaded.")
 
 def load_artifacts():
-    try:
-        with open('chunks.pkl', 'rb') as handle:
-            chunks = pickle.load(handle)
-        with open('model_name.txt', 'r', encoding='utf-8') as handle:
-            model_name = handle.read().strip() or DEFAULT_EMBEDDING_MODEL
-        index = faiss.read_index('faiss_index.faiss')
-    except Exception as exc:
-        raise FileNotFoundError('Required artifacts not found. Run ingestion first.') from exc
+    with open("chunks.pkl","rb") as f:
+        chunks=pickle.load(f)
+    with open("model_name.txt","r",encoding="utf-8") as f:
+        model=f.read().strip() or OLLAMA_EMBEDDING_MODEL
+    index=faiss.read_index("faiss_index.faiss")
+    return model,chunks,index
 
-    return model_name, chunks, index
-
-
-def format_chunk(chunk):
-    if isinstance(chunk, dict):
-        title = chunk.get('title', '').strip()
-        body = chunk.get('text', '').strip()
-        if title and body and body != title:
-            return f'{title}\n{body}'
-        return title or body
-    return str(chunk)
-
-
-def embed_texts(texts, model_name=DEFAULT_EMBEDDING_MODEL):
-    host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-    payload = {'model': model_name, 'input': list(texts)}
-    req = urllib.request.Request(
-        f'{host}/api/embed',
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-        method='POST',
+def embed_texts(texts, model_name=OLLAMA_EMBEDDING_MODEL):
+    host=os.getenv("OLLAMA_HOST","http://localhost:11434")
+    payload={"model":model_name,"input":list(texts)}
+    req=urllib.request.Request(
+        f"{host}/api/embed",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type":"application/json"},
+        method="POST",
     )
+    with urllib.request.urlopen(req,timeout=60) as resp:
+        body=json.loads(resp.read().decode())
+    emb=np.array(body["embeddings"],dtype="float32")
+    if emb.ndim==1:
+        emb=emb.reshape(1,-1)
+    return emb
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            body = json.loads(response.read().decode('utf-8'))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError) as exc:
-        raise RuntimeError(f'Unable to embed text with Ollama: {exc}') from exc
-
-    embeddings = body.get('embeddings')
-    if not embeddings:
-        raise RuntimeError('Ollama did not return any embeddings.')
-
-    array = np.array(embeddings, dtype='float32')
-    if array.ndim == 1:
-        array = array.reshape(1, -1)
-    return array
-
-
-def retrieve_file(query, k=5):
-    model_name, chunks, index = load_artifacts()
-    if not chunks:
-        return []
-
-    qvec = embed_texts([query], model_name=model_name)
-    if qvec.ndim == 1:
-        qvec = qvec.reshape(1, -1)
-
-    search_k = len(chunks)
-    _, indices = index.search(qvec, search_k)
+def retrieve_file(query, k=20):
+    model, chunks, index = load_artifacts()
+    qvec = embed_texts([query], model)
+    distances, indices = index.search(qvec, len(chunks))
     results = []
-    for idx in indices[0]:
-        if 0 <= int(idx) < len(chunks):
-            results.append((float(idx), chunks[int(idx)]))
+    print(f"Distances: {distances[0]}")
+    for d, i in zip(distances[0], indices[0]):
+        if 0 <= i < len(chunks):
+            # Skip chunks whose L2 distance is too high
+            if d > SIMILARITY_THRESHOLD:
+                continue
+            results.append((float(d), chunks[int(i)]))
 
     return results[:k]
 
+def rerank_results(query, retrieved_results, top_n=os.getenv("TOP_K_RERANK", 5)):
 
-def _synthesize_with_ollama(question, chunks):
-    host = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
-    model_name = os.getenv('OLLAMA_LLM_MODEL', DEFAULT_LLM_MODEL)
+    pairs = [
+        (query, chunk["text"])
+        for _, chunk in retrieved_results
+    ]
 
-    if not chunks:
-        return 'No information in the provided context.'
+    scores = RERANKER.predict(pairs)
 
-    context_text = '\n\n'.join(
-        f"Chunk {index + 1}: {chunk.get('text', '').strip()}"
-        for index, chunk in enumerate(chunks[:8])
+    ranked = sorted(
+        zip(scores, retrieved_results),
+        key=lambda x: x[0],
+        reverse=True,
     )
 
-    prompt = (
-        f"You are a helpful assistant. Use only the information in the provided context.\n\n"
-        f"CONTEXT:\n{context_text}\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "Answer concisely and do not invent facts."
+    top_results = [result for _, result in ranked[:top_n]]
+    top_scores = [float(score) for score, _ in ranked[:top_n]]
+
+    return top_results, top_scores
+
+def synthesize(question,chunks):
+    host=os.getenv("OLLAMA_HOST","http://localhost:11434")
+    model=os.getenv("OLLAMA_LLM_MODEL",OLLAMA_LLM_MODEL)
+    context="\n\n-----\n\n".join(c["text"] for c in chunks)
+    prompt=f"""
+You are an expert assistant.
+Use ONLY the reference material.
+Never mention chunks, context, retrieved passages or document sections.
+Combine information from multiple passages.
+Provide a detailed answer with:
+Overview
+Detailed Explanation
+Key Points
+Conclusion
+
+Reference Material:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+    payload={"model":model,"prompt":prompt,"stream":False,"options":{"temperature":0}}
+    req=urllib.request.Request(f"{host}/api/generate",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type":"application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=int(os.getenv("OLLAMA_TIMEOUT", "600"))) as resp:
+        return json.loads(resp.read().decode())["response"].strip()
+
+def answer_query(query):
+    # -----------------------------
+    # Retrieval
+    # -----------------------------
+    retrieval_start = time.perf_counter()
+
+    retrieved = retrieve_file(query, k=20)
+
+    retrieval_time = time.perf_counter() - retrieval_start
+
+    # -----------------------------
+    # Reranking
+    # -----------------------------
+    rerank_start = time.perf_counter()
+
+    reranked, reranker_scores = rerank_results(
+    query,
+    retrieved,
+    top_n=5,
     )
 
-    payload = {
-        'model': model_name,
-        'prompt': prompt,
-        'stream': False,
-        'options': {'temperature': 0.0},
-    }
+    rerank_time = time.perf_counter() - rerank_start
 
-    req = urllib.request.Request(
-        f'{host}/api/generate',
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-        method='POST',
+    chunks = [chunk for _, chunk in reranked]
+
+    # -----------------------------
+    # LLM Generation
+    # -----------------------------
+    generation_start = time.perf_counter()
+
+    ans = synthesize(query, chunks)
+
+    generation_time = time.perf_counter() - generation_start
+
+    # -----------------------------
+    # Evaluation Metrics
+    # -----------------------------
+    metrics = evaluate_pipeline(
+        retrieved_count=len(retrieved),
+        reranked_scores=reranker_scores,
+        retrieval_time=retrieval_time,
+        rerank_time=rerank_time,
+        generation_time=generation_time,
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            body = json.loads(response.read().decode('utf-8'))
-            return body.get('response', '').strip() or None
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, ConnectionRefusedError, socket.timeout, OSError):
-        return None
-
-
-def answer_query(query, k=5):
-    _, chunks, _ = load_artifacts()
-    results = retrieve_file(query, k=k)
-    ranked_chunks = [chunk for _, chunk in results]
-
-    start_time = time.perf_counter()
-    text = _synthesize_with_ollama(query, ranked_chunks)
-    latency = time.perf_counter() - start_time
-
-    if text:
-        return f'{text}\n\nLLM latency: {latency:.3f} seconds'
-
-    return 'Ollama did not return a response. Check that the Ollama server is running and the requested model is available.'
-
+    # -----------------------------
+    # Final Response
+    # -----------------------------
+    return (
+        f"{ans}\n\n"
+        f"{metrics.format_report()}"
+    )
 
 def main():
-    parser = argparse.ArgumentParser(description='Query the embedding-based FAISS index of documents')
-    parser.add_argument('query', nargs='*', help='Query text (if omitted, enters interactive prompt)')
-    parser.add_argument('-k', '--k', type=int, default=5, help='Number of results to return')
-    parser.add_argument('--answer', action='store_true', help='Return a synthesized answer using the local Ollama model instead of raw chunks')
-    args = parser.parse_args()
-
-    if args.query:
-        q = ' '.join(args.query)
-        try:
-            if args.answer:
-                ans = answer_query(q, k=args.k)
-                print(ans)
-                return
-            results = retrieve_file(q, k=args.k)
-        except FileNotFoundError as exc:
-            print(exc)
-            return
-
-        for _, chunk in results:
-            print(format_chunk(chunk))
-            print('---')
+    parser=argparse.ArgumentParser()
+    parser.add_argument("query",nargs="*")
+    parser.add_argument("--answer",action="store_true")
+    args=parser.parse_args()
+    q=" ".join(args.query)
+    if args.answer:
+        print(answer_query(q))
     else:
-        try:
-            while True:
-                q = input('Enter query (Ctrl-D to exit): ').strip()
-                if not q:
-                    continue
-                try:
-                    if args.answer:
-                        ans = answer_query(q, k=args.k)
-                        print(ans)
-                        continue
-                    results = retrieve_file(q, k=args.k)
-                except FileNotFoundError as exc:
-                    print(exc)
-                    return
+        res=rerank_results(q,retrieve_file(q,20),5)
+        for _,c in res:
+            print(c["text"])
+            print("-"*80)
 
-                for _, chunk in results:
-                    print(format_chunk(chunk))
-                    print('---')
-        except EOFError:
-            print('\nExiting.')
-
-
-if __name__ == '__main__':
+if __name__=="__main__":
     main()
